@@ -4,9 +4,13 @@ use std::convert::TryInto;
 // register addresses taken from BME680 datasheet (page 28)
 const REG_CTRL_HUM: u8 = 0x72;
 const REG_CTRL_MEAS: u8 = 0x74;
-// parameter registers, page 18
+// temperature parameter registers, page 18
 const REG_PAR_T1: u8 = 0xE9;
 const REG_PAR_T23: u8 = 0x8A;
+// pressure parameter registers, page 19
+const REG_PAR_P: u8 = 0x8E;
+// humidity parameter registers, page 20
+const REG_PAR_H: u8 = 0xE1;
 
 struct Ready;
 struct NotReady;
@@ -32,7 +36,7 @@ impl Bme680<NotReady> {
 }
 
 impl Bme680<Ready> {
-    fn sample(&self) -> Result<(u32, f64, u16), i2c::I2cError> {
+    fn sample(&self) -> Result<(f64, f64, f64), i2c::I2cError> {
         let mode = 1;
 
         let to_write = [
@@ -45,26 +49,27 @@ impl Bme680<Ready> {
 
         std::thread::sleep(std::time::Duration::from_secs(1));
         let (p, t, h) = self.read_pth()?;
-        let t = self.calibration.calculate_temperature(t);
+        let (p, t, h) = self.calibration.calculate_pth(p, t, h);
         Ok((p, t, h))
     }
 
-    fn read_pth(&self) -> Result<(u32, u32, u16), i2c::I2cError> {
+    fn read_pth(&self) -> Result<(i32, i32, i16), i2c::I2cError> {
         // pressure, temperature and humidity registers go from 0x1F to 0x26
         // see page 28, BME680 datasheet
         let address = 0x1F;
-        let buffer = self.device.i2c_read(address, 8)?;
+        let mut buffer = [0; 8];
+        self.device.i2c_read(address, &mut buffer)?;
         let buf_checked = &buffer[..8];
 
         // pressure bits - 0x1F, 0x20, first 4 bits of 0x21
         let temp = buf_checked[..4].try_into().unwrap();
-        let pressure = u32::from_be_bytes(temp) >> 12;
+        let pressure = i32::from_be_bytes(temp) >> 12;
         // temperature bits - 0x22, 0x23, first 4 bits of 0x24
         let temp = buf_checked[3..7].try_into().unwrap();
-        let temperature = u32::from_be_bytes(temp) >> 12;
+        let temperature = i32::from_be_bytes(temp) >> 12;
         // humidity bits - 0x25, 0x26
         let temp = buf_checked[6..8].try_into().unwrap();
-        let humidity = u16::from_be_bytes(temp);
+        let humidity = i16::from_be_bytes(temp);
 
         Ok((pressure, temperature, humidity))
     }
@@ -150,27 +155,77 @@ impl std::convert::From<OverSample> for u8 {
     }
 }
 
+// all parameter types taken from:
+// https://github.com/BoschSensortec/BME68x-Sensor-API/blob/master/bme68x_defs.h
+#[derive(Debug)]
 struct CalibrationParameters {
+    temperature: TempParams,
+    pressure: PresParams,
+    humidity: HumParams,
+}
+
+// see datasheet page 18 for addressess
+#[derive(Debug)]
+struct TempParams {
     temp_1: u16,
     temp_2: u16,
-    temp_3: u8,
+    temp_3: i8,
+}
+
+// see datasheet page 19 for addressess
+#[derive(Debug)]
+struct PresParams {
+    pres_1: u16,
+    pres_2: i16,
+    pres_3: i8,
+    pres_4: i16,
+    pres_5: i16,
+    pres_6: i8,
+    pres_7: i8,
+    pres_8: i16,
+    pres_9: i16,
+    pres_10: u8,
+}
+
+// see datasheet page 20 for addressess
+#[derive(Debug)]
+struct HumParams {
+    hum_1: u16,
+    hum_2: u16,
+    hum_3: i8,
+    hum_4: i8,
+    hum_5: i8,
+    hum_6: u8,
+    hum_7: i8,
 }
 
 impl CalibrationParameters {
     fn read(device: &I2c) -> Result<Self, i2c::I2cError> {
+        let temperature = CalibrationParameters::read_temp_params(device)?;
+        let pressure = CalibrationParameters::read_pres_params(device)?;
+        let humidity = CalibrationParameters::read_hum_params(device)?;
+
+        Ok(Self {
+            temperature,
+            pressure,
+            humidity,
+        })
+    }
+
+    fn calculate_pth(&self, raw_pres: i32, raw_temp: i32, raw_hum: i16) -> (f64, f64, f64) {
+        let (temperature, t_fine) = self.calculate_temperature(raw_temp);
+        let pressure = self.calculate_pressure(raw_pres, t_fine);
+        let humidity = self.calculate_humidity(raw_hum, temperature);
+
+        (pressure, temperature, humidity)
+    }
+
+    fn read_temp_params(device: &I2c) -> Result<TempParams, i2c::I2cError> {
         let mut buffer = [0; 5];
         let (mut t_1, mut t_23) = buffer.split_at_mut(2);
 
-        device
-            .i2c_buffer()
-            .add_write(0, std::slice::from_ref(&REG_PAR_T1))
-            .add_read(0, &mut t_1)
-            .execute()?;
-        device
-            .i2c_buffer()
-            .add_write(0, std::slice::from_ref(&REG_PAR_T23))
-            .add_read(0, &mut t_23)
-            .execute()?;
+        device.i2c_read(REG_PAR_T1, &mut t_1)?;
+        device.i2c_read(REG_PAR_T23, &mut t_23)?;
 
         let buf_checked = &buffer[..5];
 
@@ -181,37 +236,196 @@ impl CalibrationParameters {
         let par = buf_checked[2..4].try_into().unwrap();
         let temp_2 = u16::from_le_bytes(par);
         // par_t3 bits, 0x8C
-        let temp_3 = buffer[4];
+        let par = buf_checked[4..5].try_into().unwrap();
+        let temp_3 = i8::from_le_bytes(par);
 
-        Ok(Self {
+        Ok(TempParams {
             temp_1,
             temp_2,
             temp_3,
         })
     }
 
-    // calculation as definted in BME680 datasheet (page 17)
-    fn calculate_temperature(&self, raw_temp: u32) -> f64 {
-        let raw_temp = f64::from(raw_temp);
-        let temp_1 = f64::from(self.temp_1);
-        let temp_2 = f64::from(self.temp_2);
-        let temp_3 = f64::from(self.temp_3);
+    fn read_pres_params(device: &I2c) -> Result<PresParams, i2c::I2cError> {
+        let mut buffer = [0; 19];
+        device.i2c_read(REG_PAR_P, &mut buffer)?;
+        let buf_checked = &buffer[..19];
 
-        let var_1 = temp_2 * (raw_temp / 16384.0 - temp_1 / 1024.0);
-        let var_2 = 16.0
-            * temp_3
-            * (raw_temp / 131072.0 - temp_1 / 8192.0)
-            * (raw_temp / 131072.0 - temp_1 / 8192.0);
-        (var_1 + var_2) / 5120.0
+        // par_p1 bits, 0x8F, 0x8E
+        let par = buf_checked[..2].try_into().unwrap();
+        let pres_1 = u16::from_le_bytes(par);
+        // par_p2 bits, 0x91, 0x90
+        let par = buf_checked[2..4].try_into().unwrap();
+        let pres_2 = i16::from_le_bytes(par);
+        // par_p3 bits, 0x92
+        let par = buf_checked[4..5].try_into().unwrap();
+        let pres_3 = i8::from_le_bytes(par);
+        // par_p4 bits, 0x95, 0x94
+        let par = buf_checked[6..8].try_into().unwrap();
+        let pres_4 = i16::from_le_bytes(par);
+        // par_p5 bits, 0x97, 0x96
+        let par = buf_checked[8..10].try_into().unwrap();
+        let pres_5 = i16::from_le_bytes(par);
+        // par_p6 bits, 0x99
+        let par = buf_checked[11..12].try_into().unwrap();
+        let pres_6 = i8::from_le_bytes(par);
+        // par_p7 bits, 0x98
+        let par = buf_checked[10..11].try_into().unwrap();
+        let pres_7 = i8::from_le_bytes(par);
+        // par_p8 bits, 0x9D, 0x9C
+        let par = buf_checked[14..16].try_into().unwrap();
+        let pres_8 = i16::from_le_bytes(par);
+        // par_p9 bits, 0x9F, 0x9E
+        let par = buf_checked[16..18].try_into().unwrap();
+        let pres_9 = i16::from_le_bytes(par);
+        // par_p10 bits, 0xA0
+        let par = buf_checked[18..19].try_into().unwrap();
+        let pres_10 = u8::from_le_bytes(par);
+
+        Ok(PresParams {
+            pres_1,
+            pres_2,
+            pres_3,
+            pres_4,
+            pres_5,
+            pres_6,
+            pres_7,
+            pres_8,
+            pres_9,
+            pres_10,
+        })
+    }
+
+    fn read_hum_params(device: &I2c) -> Result<HumParams, i2c::I2cError> {
+        let mut buffer = [0; 8];
+        device.i2c_read(REG_PAR_H, &mut buffer)?;
+        let buf_checked = &buffer[..8];
+
+        // par_p1 bits, 0xE3, 0xE2<3:0>
+        let mut par: [u8; 2] = buf_checked[1..3].try_into().unwrap();
+        par[0] <<= 4;
+        let hum_1 = u16::from_le_bytes(par) >> 4;
+        // par_p2 bits, 0xE1, 0xE2<7:4>
+        let par = buf_checked[..2].try_into().unwrap();
+        let hum_2 = u16::from_be_bytes(par) >> 4;
+        // par_p3 bits, 0xE4
+        let par = buf_checked[3..4].try_into().unwrap();
+        let hum_3 = i8::from_le_bytes(par);
+        // par_p4 bits, 0xE5
+        let par = buf_checked[4..5].try_into().unwrap();
+        let hum_4 = i8::from_le_bytes(par);
+        // par_p5 bits, 0xE6
+        let par = buf_checked[5..6].try_into().unwrap();
+        let hum_5 = i8::from_le_bytes(par);
+        // par_p6 bits, 0xE7
+        let par = buf_checked[6..7].try_into().unwrap();
+        let hum_6 = u8::from_le_bytes(par);
+        // par_p7 bits, 0xE8
+        let par = buf_checked[7..8].try_into().unwrap();
+        let hum_7 = i8::from_le_bytes(par);
+
+        Ok(HumParams {
+            hum_1,
+            hum_2,
+            hum_3,
+            hum_4,
+            hum_5,
+            hum_6,
+            hum_7,
+        })
+    }
+
+    // calculation as definted in BME680 datasheet (page 17)
+    fn calculate_temperature(&self, raw_temp: i32) -> (f64, f64) {
+        const PAR1: f64 = 1.0 / 16384.0;
+        const PAR2: f64 = 1.0 / 1024.0;
+        const PAR3: f64 = 1.0 / 131072.0;
+        const PAR4: f64 = 1.0 / 8192.0;
+        const PAR5: f64 = 1.0 / 5120.0;
+
+        let raw_temp = f64::from(raw_temp);
+        let params = &self.temperature;
+        let temp_1 = f64::from(params.temp_1);
+        let temp_2 = f64::from(params.temp_2);
+        let temp_3 = f64::from(params.temp_3);
+
+        let var_1 = temp_2 * (raw_temp * PAR1 - temp_1 * PAR2);
+        let var_2 =
+            16.0 * temp_3 * (raw_temp * PAR3 - temp_1 * PAR4) * (raw_temp * PAR3 - temp_1 * PAR4);
+        let t_fine = var_1 + var_2;
+        (t_fine * PAR5, t_fine)
+    }
+
+    // calculation as definted in BME680 datasheet (page 18)
+    fn calculate_pressure(&self, raw_pres: i32, t_fine: f64) -> f64 {
+        const PAR1: f64 = 1.0 / 131072.0;
+        const PAR2: f64 = 1.0 / 16384.0;
+        const PAR3: f64 = 1.0 / 524288.0;
+        const PAR4: f64 = 1.0 / 32768.0;
+        const PAR5: f64 = 1.0 / 4096.0;
+        const PAR6: f64 = 1.0 / 2147483648.0;
+        const PAR7: f64 = 1.0 / 256.0;
+        const PAR8: f64 = 1.0 / 16.0;
+
+        let raw_pres = f64::from(raw_pres);
+        let params = &self.pressure;
+        let pres_1 = f64::from(params.pres_1);
+        let pres_2 = f64::from(params.pres_2);
+        let pres_3 = f64::from(params.pres_3);
+        let pres_4 = f64::from(params.pres_4);
+        let pres_5 = f64::from(params.pres_5);
+        let pres_6 = f64::from(params.pres_6);
+        let pres_7 = f64::from(params.pres_7);
+        let pres_8 = f64::from(params.pres_8);
+        let pres_9 = f64::from(params.pres_9);
+        let pres_10 = f64::from(params.pres_10);
+
+        let var_1 = t_fine * 0.5 - 64000.0;
+        let var_2 = var_1 * var_1 * pres_6 * PAR1;
+        let var_2 = var_2 + var_1 * pres_5 * 2.0;
+        let var_2 = var_2 * 0.25 + pres_4 * 65536.0;
+        let var_1 = (var_1 * var_1 * pres_3 * PAR2 + var_1 * pres_2) * PAR3;
+        let var_1 = (1.0 + var_1 * PAR4) * pres_1;
+        let pressure = 1048576.0 - raw_pres;
+        let pressure = (pressure - var_2 * PAR5) * 6250.0 / var_1;
+        let var_1 = pressure * pressure * pres_9 * PAR6;
+        let var_2 = pressure * pres_8 * PAR4;
+        let var_3 = pressure * pressure * pressure * pres_10 * PAR7 * PAR7 * PAR7 * PAR1;
+        pressure + (var_1 + var_2 + var_3 + pres_7 * 128.0) * PAR8
+    }
+
+    // calculation as definted in BME680 datasheet (page 20)
+    fn calculate_humidity(&self, raw_hum: i16, temp: f64) -> f64 {
+        const PAR1: f64 = 1.0 / 262144.0;
+        const PAR2: f64 = 1.0 / 16384.0;
+        const PAR3: f64 = 1.0 / 1048576.0;
+        const PAR4: f64 = 1.0 / 2097152.0;
+
+        let raw_hum = f64::from(raw_hum);
+        let params = &self.humidity;
+        let hum_1 = f64::from(params.hum_1);
+        let hum_2 = f64::from(params.hum_2);
+        let hum_3 = f64::from(params.hum_3);
+        let hum_4 = f64::from(params.hum_4);
+        let hum_5 = f64::from(params.hum_5);
+        let hum_6 = f64::from(params.hum_6);
+        let hum_7 = f64::from(params.hum_7);
+
+        let var_1 = raw_hum - (hum_1 * 16.0 + temp * hum_3 * 0.5);
+        let var_2 = var_1 * hum_2 * PAR1 * (1.0 + hum_4 * PAR2 * temp + hum_5 * PAR3 * temp * temp);
+        let var_3 = hum_6 * PAR2;
+        let var_4 = hum_7 * PAR4;
+        var_2 + (var_3 + var_4 * temp) * var_2 * var_2
     }
 }
 
 fn main() {
     let mut config = Config::new();
-    config.humidity(OverSample::X1);
+    config.humidity(OverSample::X16);
     config.temperature(OverSample::X16);
     config.pressure(OverSample::X16);
     let bme = Bme680::open(config).unwrap().apply_settings().unwrap();
+    println!("{:#?}", bme.calibration);
     println!("{:?}", bme.sample());
     bme.reset().unwrap();
 }
