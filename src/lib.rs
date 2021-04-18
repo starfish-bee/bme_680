@@ -1,5 +1,9 @@
-use i2c::I2c;
+use i2c::{I2c, I2cError};
 use std::convert::TryInto;
+use thiserror::Error;
+
+// BME680 I2C address
+const I2C_ADDRESS: u16 = 0x76;
 
 // register addresses taken from BME680 datasheet (page 28)
 const REG_CTRL_HUM: u8 = 0x72;
@@ -11,6 +15,8 @@ const REG_PAR_T23: u8 = 0x8A;
 const REG_PAR_P: u8 = 0x8E;
 // humidity parameter registers, page 20
 const REG_PAR_H: u8 = 0xE1;
+
+pub type BmeResult<T> = Result<T, BmeError>;
 
 pub struct Ready;
 pub struct NotReady;
@@ -24,8 +30,8 @@ pub struct Bme680<T> {
 }
 
 impl Bme680<NotReady> {
-    pub fn open(config: Config) -> Result<Self, i2c::I2cError> {
-        let device = I2c::open(0x76)?;
+    pub fn open(config: Config) -> BmeResult<Self> {
+        let device = I2c::open(I2C_ADDRESS).map_err(BmeError::OpenError)?;
         let calibration = CalibrationParameters::read(&device)?;
         Ok(Self {
             device,
@@ -37,7 +43,7 @@ impl Bme680<NotReady> {
 }
 
 impl Bme680<Ready> {
-    pub fn sample(&self) -> Result<(f64, f64, f64), i2c::I2cError> {
+    pub fn sample(&self) -> BmeResult<(f64, f64, f64)> {
         let mode = 1;
 
         let to_write = [
@@ -46,7 +52,11 @@ impl Bme680<Ready> {
                 | (u8::from(self.config.p_oversample) << 2)
                 | mode,
         ];
-        self.device.i2c_buffer().add_write(0, &to_write).execute()?;
+        self.device
+            .i2c_buffer()
+            .add_write(0, &to_write)
+            .execute()
+            .map_err(BmeError::ForceError)?;
 
         std::thread::sleep(std::time::Duration::from_secs(1));
         let (p, t, h) = self.read_pth()?;
@@ -54,12 +64,14 @@ impl Bme680<Ready> {
         Ok((p, t, h))
     }
 
-    fn read_pth(&self) -> Result<(i32, i32, i16), i2c::I2cError> {
+    fn read_pth(&self) -> BmeResult<(i32, i32, i16)> {
         // pressure, temperature and humidity registers go from 0x1F to 0x26
         // see page 28, BME680 datasheet
         let address = 0x1F;
         let mut buffer = [0; 8];
-        self.device.i2c_read(address, &mut buffer)?;
+        self.device
+            .i2c_read(address, &mut buffer)
+            .map_err(BmeError::MeasurementError)?;
         let buf_checked = &buffer[..8];
 
         // pressure bits - 0x1F, 0x20, first 4 bits of 0x21
@@ -77,9 +89,13 @@ impl Bme680<Ready> {
 }
 
 impl<T> Bme680<T> {
-    pub fn apply_settings(self) -> Result<Bme680<Ready>, i2c::I2cError> {
+    pub fn apply_settings(self) -> BmeResult<Bme680<Ready>> {
         let to_write = [REG_CTRL_HUM, u8::from(self.config.h_oversample)];
-        self.device.i2c_buffer().add_write(0, &to_write).execute()?;
+        self.device
+            .i2c_buffer()
+            .add_write(0, &to_write)
+            .execute()
+            .map_err(BmeError::SetError)?;
         Ok(Bme680 {
             device: self.device,
             config: self.config,
@@ -88,13 +104,17 @@ impl<T> Bme680<T> {
         })
     }
 
-    pub fn reset(self) -> Result<Bme680<NotReady>, i2c::I2cError> {
+    pub fn reset(self) -> BmeResult<Bme680<NotReady>> {
         // writing 0xB6 to register 0xE0 triggers a soft reset
         // see page 30, BME680 datasheet
         let value = 0xB6;
         let register = 0xE0;
         let buf = [register, value];
-        self.device.i2c_buffer().add_write(0, &buf).execute()?;
+        self.device
+            .i2c_buffer()
+            .add_write(0, &buf)
+            .execute()
+            .map_err(BmeError::SetError)?;
 
         // register 0x1F reset state value is 0x80
         // see page 28, BME680 datasheet
@@ -212,7 +232,7 @@ struct HumParams {
 }
 
 impl CalibrationParameters {
-    fn read(device: &I2c) -> Result<Self, i2c::I2cError> {
+    fn read(device: &I2c) -> BmeResult<Self> {
         let temperature = CalibrationParameters::read_temp_params(device)?;
         let pressure = CalibrationParameters::read_pres_params(device)?;
         let humidity = CalibrationParameters::read_hum_params(device)?;
@@ -232,12 +252,16 @@ impl CalibrationParameters {
         (pressure, temperature, humidity)
     }
 
-    fn read_temp_params(device: &I2c) -> Result<TempParams, i2c::I2cError> {
+    fn read_temp_params(device: &I2c) -> BmeResult<TempParams> {
         let mut buffer = [0; 5];
         let (mut t_1, mut t_23) = buffer.split_at_mut(2);
 
-        device.i2c_read(REG_PAR_T1, &mut t_1)?;
-        device.i2c_read(REG_PAR_T23, &mut t_23)?;
+        device
+            .i2c_read(REG_PAR_T1, &mut t_1)
+            .map_err(BmeError::ParamError)?;
+        device
+            .i2c_read(REG_PAR_T23, &mut t_23)
+            .map_err(BmeError::ParamError)?;
 
         let buf_checked = &buffer[..5];
 
@@ -258,9 +282,11 @@ impl CalibrationParameters {
         })
     }
 
-    fn read_pres_params(device: &I2c) -> Result<PresParams, i2c::I2cError> {
+    fn read_pres_params(device: &I2c) -> BmeResult<PresParams> {
         let mut buffer = [0; 19];
-        device.i2c_read(REG_PAR_P, &mut buffer)?;
+        device
+            .i2c_read(REG_PAR_P, &mut buffer)
+            .map_err(BmeError::ParamError)?;
         let buf_checked = &buffer[..19];
 
         // par_p1 bits, 0x8F, 0x8E
@@ -308,9 +334,11 @@ impl CalibrationParameters {
         })
     }
 
-    fn read_hum_params(device: &I2c) -> Result<HumParams, i2c::I2cError> {
+    fn read_hum_params(device: &I2c) -> BmeResult<HumParams> {
         let mut buffer = [0; 8];
-        device.i2c_read(REG_PAR_H, &mut buffer)?;
+        device
+            .i2c_read(REG_PAR_H, &mut buffer)
+            .map_err(BmeError::ParamError)?;
         let buf_checked = &buffer[..8];
 
         // par_p1 bits, 0xE3, 0xE2<3:0>
@@ -348,6 +376,7 @@ impl CalibrationParameters {
     }
 
     // calculation as definted in BME680 datasheet (page 17)
+    // t_fine parameter returned for use in pressure calculation (see page 18)
     fn calculate_temperature(&self, raw_temp: i32) -> (f64, f64) {
         const PAR1: f64 = 1.0 / 16384.0;
         const PAR2: f64 = 1.0 / 1024.0;
@@ -429,4 +458,20 @@ impl CalibrationParameters {
         let var_4 = hum_7 * PAR4;
         var_2 + (var_3 + var_4 * temp) * var_2 * var_2
     }
+}
+
+#[derive(Debug, Error)]
+pub enum BmeError {
+    #[error("failed to open device at address {}", I2C_ADDRESS)]
+    OpenError(#[source] I2cError),
+    #[error("failed to set force mode")]
+    ForceError(#[source] I2cError),
+    #[error("failed to read measurements")]
+    MeasurementError(#[source] I2cError),
+    #[error("failed to read calibration parameters")]
+    ParamError(#[source] I2cError),
+    #[error("failed to set force mode")]
+    SetError(#[source] I2cError),
+    #[error("failed to set force mode")]
+    ResetError(#[source] I2cError),
 }

@@ -8,3 +8,5 @@ edition = "2018"
 
 [dependencies]
 i2c = { path = "../i2c" }
+thiserror = "1.0"
+anyhow = "1.0"
