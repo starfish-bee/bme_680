@@ -148,6 +148,12 @@ pub struct Config {
     p_oversample: OverSample,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Config {
     pub fn new() -> Self {
         Self {
@@ -462,7 +468,7 @@ impl CalibrationParameters {
 
 #[derive(Debug, Error)]
 pub enum BmeError {
-    #[error("failed to open device at address {}", I2C_ADDRESS)]
+    #[error("failed to open device at address 0x{:X}", I2C_ADDRESS)]
     OpenError(#[source] I2cError),
     #[error("failed to set force mode")]
     ForceError(#[source] I2cError),
@@ -470,8 +476,8 @@ pub enum BmeError {
     MeasurementError(#[source] I2cError),
     #[error("failed to read calibration parameters")]
     ParamError(#[source] I2cError),
-    #[error("failed to set force mode")]
+    #[error("failed to apply parameters")]
     SetError(#[source] I2cError),
-    #[error("failed to set force mode")]
+    #[error("failed to reset")]
     ResetError(#[source] I2cError),
 }
