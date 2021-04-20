@@ -5,15 +5,19 @@ use thiserror::Error;
 // BME680 I2C address
 const I2C_ADDRESS: u16 = 0x76;
 
-// register addresses taken from BME680 datasheet (page 28)
+// register addresses taken from BME680 datasheet memory map (page 28)
+// pressure, temperature and humidity data registers
+const REG_DATA_PTH: u8 = 0x1F;
+// humidity oversample register
 const REG_CTRL_HUM: u8 = 0x72;
+// temperature and pressure oversample register
 const REG_CTRL_MEAS: u8 = 0x74;
-// temperature parameter registers, page 18
+// temperature parameter registers (page 18)
 const REG_PAR_T1: u8 = 0xE9;
 const REG_PAR_T23: u8 = 0x8A;
-// pressure parameter registers, page 19
+// pressure parameter registers (page 19)
 const REG_PAR_P: u8 = 0x8E;
-// humidity parameter registers, page 20
+// humidity parameter registers (page 20)
 const REG_PAR_H: u8 = 0xE1;
 
 pub type BmeResult<T> = Result<T, BmeError>;
@@ -67,10 +71,9 @@ impl Bme680<Ready> {
     fn read_pth(&self) -> BmeResult<(i32, i32, i16)> {
         // pressure, temperature and humidity registers go from 0x1F to 0x26
         // see page 28, BME680 datasheet
-        let address = 0x1F;
         let mut buffer = [0; 8];
         self.device
-            .i2c_read(address, &mut buffer)
+            .i2c_read(REG_DATA_PTH, &mut buffer)
             .map_err(BmeError::MeasurementError)?;
         let buf_checked = &buffer[..8];
 
@@ -118,12 +121,16 @@ impl<T> Bme680<T> {
 
         // register 0x1F reset state value is 0x80
         // see page 28, BME680 datasheet
-        //let test_value = 0x80;
-        //let test_register = 0x1F;
-        //match self.device.i2c_read(test_register, 1)?[..1] {
-        //    [x] if x == test_value => Ok(true),
-        //    _ => Ok(false),
-        //}
+        let test_value = 0x80;
+        match self
+            .device
+            .i2c_read(REG_DATA_PTH, 1)
+            .map_err(BmeError::ResetError)?[..1]
+        {
+            [x] if x == test_value => Ok(true),
+            _ => Ok(false),
+        }
+
         Ok(Bme680 {
             device: self.device,
             config: self.config,
@@ -479,5 +486,13 @@ pub enum BmeError {
     #[error("failed to apply parameters")]
     SetError(#[source] I2cError),
     #[error("failed to reset")]
-    ResetError(#[source] I2cError),
+    ResetError(#[source] ResetError),
+}
+
+#[derive(Debug, Error)]
+pub enum ResetError {
+    #[error(transparent)]
+    I2cError(I2cError),
+    #[error("device values not reset")]
+    ResetFail,
 }
