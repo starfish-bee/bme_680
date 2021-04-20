@@ -1,5 +1,5 @@
 use anyhow::Context;
-use bme_680::{Bme680, Config, OverSample};
+use bme_680::{Bme680, Config, IirFilter, OverSample};
 
 fn main() -> anyhow::Result<()> {
     let loop_time = std::time::Duration::from_secs(5);
@@ -7,6 +7,7 @@ fn main() -> anyhow::Result<()> {
     config.humidity(OverSample::X1);
     config.temperature(OverSample::X2);
     config.pressure(OverSample::X16);
+    config.iir_filter(IirFilter::C63);
     let bme = Bme680::open(config)?.apply_settings()?;
     println!("Config:\n{:?}", config);
     loop {

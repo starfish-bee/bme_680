@@ -12,6 +12,8 @@ const REG_DATA_PTH: u8 = 0x1F;
 const REG_CTRL_HUM: u8 = 0x72;
 // temperature and pressure oversample register
 const REG_CTRL_MEAS: u8 = 0x74;
+// IIR filter register
+const REG_CONFIG: u8 = 0x75;
 // temperature parameter registers (page 18)
 const REG_PAR_T1: u8 = 0xE9;
 const REG_PAR_T23: u8 = 0x8A;
@@ -93,7 +95,14 @@ impl Bme680<Ready> {
 
 impl<T> Bme680<T> {
     pub fn apply_settings(self) -> BmeResult<Bme680<Ready>> {
-        let to_write = [REG_CTRL_HUM, u8::from(self.config.h_oversample)];
+        // temperature and pressure oversampling is set in the same register that triggers force
+        // mode, so are not set until a measurement is triggered
+        let to_write = [
+            REG_CTRL_HUM,
+            u8::from(self.config.h_oversample),
+            REG_CONFIG,
+            u8::from(self.config.iir_filter) << 2,
+        ];
         self.device
             .i2c_buffer()
             .add_write(0, &to_write)
@@ -122,13 +131,12 @@ impl<T> Bme680<T> {
         // register 0x1F reset state value is 0x80
         // see page 28, BME680 datasheet
         let test_value = 0x80;
-        match self
+        let test_result = self
             .device
-            .i2c_read(REG_DATA_PTH, 1)
-            .map_err(BmeError::ResetError)?[..1]
-        {
-            [x] if x == test_value => Ok(true),
-            _ => Ok(false),
+            .i2c_read_bytes(REG_DATA_PTH, 1)
+            .map_err(ResetError::I2cError)?[0];
+        if test_result != test_value {
+            return Err(ResetError::ResetFail.into());
         }
 
         Ok(Bme680 {
@@ -153,6 +161,7 @@ pub struct Config {
     h_oversample: OverSample,
     t_oversample: OverSample,
     p_oversample: OverSample,
+    iir_filter: IirFilter,
 }
 
 impl Default for Config {
@@ -167,6 +176,7 @@ impl Config {
             h_oversample: OverSample::X0,
             t_oversample: OverSample::X0,
             p_oversample: OverSample::X0,
+            iir_filter: IirFilter::C0,
         }
     }
 
@@ -180,6 +190,10 @@ impl Config {
 
     pub fn pressure(&mut self, oversample: OverSample) {
         self.p_oversample = oversample
+    }
+
+    pub fn iir_filter(&mut self, filter: IirFilter) {
+        self.iir_filter = filter;
     }
 }
 
@@ -200,6 +214,24 @@ impl std::convert::From<OverSample> for u8 {
     }
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[repr(u8)]
+pub enum IirFilter {
+    C0 = 0b000,
+    C1 = 0b001,
+    C3 = 0b010,
+    C7 = 0b011,
+    C15 = 0b100,
+    C31 = 0b101,
+    C63 = 0b110,
+    C127 = 0b111,
+}
+
+impl std::convert::From<IirFilter> for u8 {
+    fn from(arg: IirFilter) -> u8 {
+        arg as u8
+    }
+}
 // all parameter types taken from:
 // https://github.com/BoschSensortec/BME68x-Sensor-API/blob/master/bme68x_defs.h
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -486,7 +518,7 @@ pub enum BmeError {
     #[error("failed to apply parameters")]
     SetError(#[source] I2cError),
     #[error("failed to reset")]
-    ResetError(#[source] ResetError),
+    ResetError(#[from] ResetError),
 }
 
 #[derive(Debug, Error)]
