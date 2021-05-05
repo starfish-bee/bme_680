@@ -8,12 +8,24 @@ const I2C_ADDRESS: u16 = 0x76;
 // register addresses taken from BME680 datasheet memory map (page 28)
 // pressure, temperature and humidity data registers
 const REG_DATA_PTH: u8 = 0x1F;
+// gas data registers
+const REG_DATA_G: u8 = 0x2A;
+// status registers
+const REG_MEAS_STATUS_0: u8 = 0x1D;
+
+// target resistance set point
+const REG_RES_HEAT: u8 = 0x5A;
+// heater time set point
+const REG_GAS_WAIT: u8 = 0x64;
+// gas and heater set point register
+const REG_CTRL_GAS_1: u8 = 0x71;
 // humidity oversample register
 const REG_CTRL_HUM: u8 = 0x72;
 // temperature and pressure oversample register
 const REG_CTRL_MEAS: u8 = 0x74;
 // IIR filter register
 const REG_CONFIG: u8 = 0x75;
+
 // temperature parameter registers (page 18)
 const REG_PAR_T1: u8 = 0xE9;
 const REG_PAR_T23: u8 = 0x8A;
@@ -21,10 +33,18 @@ const REG_PAR_T23: u8 = 0x8A;
 const REG_PAR_P: u8 = 0x8E;
 // humidity parameter registers (page 20)
 const REG_PAR_H: u8 = 0xE1;
+// gas parameter registers (page 22)
+const REG_PAR_G: u8 = 0xEB;
+// heater resistance range register (page 22)
+const REG_RES_HEAT_RANGE: u8 = 0x02;
+// heater resistance value register (page 22)
+const REG_RES_HEAT_VAL: u8 = 0x00;
 
 pub type BmeResult<T> = Result<T, BmeError>;
 
+#[derive(Debug)]
 pub struct Ready;
+#[derive(Debug)]
 pub struct NotReady;
 
 #[derive(Debug)]
@@ -49,7 +69,7 @@ impl Bme680<NotReady> {
 }
 
 impl Bme680<Ready> {
-    pub fn sample(&self) -> BmeResult<(f64, f64, f64)> {
+    pub fn sample(&self) -> BmeResult<Data> {
         let mode = 1;
 
         let to_write = [
@@ -64,13 +84,49 @@ impl Bme680<Ready> {
             .execute()
             .map_err(BmeError::ForceError)?;
 
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        let (p, t, h) = self.read_pth()?;
-        let (p, t, h) = self.calibration.calculate_pth(p, t, h);
-        Ok((p, t, h))
+        let mut new_data = 0;
+        while (new_data & 0b1000_0000) == 0 {
+            self.device
+                .i2c_read(REG_MEAS_STATUS_0, std::slice::from_mut(&mut new_data))
+                .map_err(BmeError::StatusError)?;
+        }
+
+        let data = self.read_pthg()?;
+        let data = self.calibration.calculate_values(data);
+        Ok(data)
     }
 
-    fn read_pth(&self) -> BmeResult<(i32, i32, i16)> {
+    pub fn sample_with_delay(&self, delay: u64) -> BmeResult<Data> {
+        let mode = 1;
+
+        let to_write = [
+            REG_CTRL_MEAS,
+            (u8::from(self.config.t_oversample) << 5)
+                | (u8::from(self.config.p_oversample) << 2)
+                | mode,
+        ];
+        self.device
+            .i2c_buffer()
+            .add_write(0, &to_write)
+            .execute()
+            .map_err(BmeError::ForceError)?;
+
+        let mut new_data = 0;
+
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+
+        while (new_data & 0b1000_0000) == 0 {
+            self.device
+                .i2c_read(REG_MEAS_STATUS_0, std::slice::from_mut(&mut new_data))
+                .map_err(BmeError::StatusError)?;
+        }
+
+        let data = self.read_pthg()?;
+        let data = self.calibration.calculate_values(data);
+        Ok(data)
+    }
+
+    fn read_pthg(&self) -> BmeResult<RawData> {
         // pressure, temperature and humidity registers go from 0x1F to 0x26
         // see page 28, BME680 datasheet
         let mut buffer = [0; 8];
@@ -89,7 +145,26 @@ impl Bme680<Ready> {
         let temp = buf_checked[6..8].try_into().unwrap();
         let humidity = i16::from_be_bytes(temp);
 
-        Ok((pressure, temperature, humidity))
+        // gas registers go from 0x2A to 0x2B
+        self.device
+            .i2c_read(REG_DATA_G, &mut buffer[..2])
+            .map_err(BmeError::MeasurementError)?;
+        let buf_checked = &buffer[..2];
+
+        // gas bits - 0x2A, first 2 bits of 0x2B
+        let temp = buf_checked[..2].try_into().unwrap();
+        let resistance = i16::from_be_bytes(temp) >> 6;
+        let temp = buf_checked[1..2].try_into().unwrap();
+        let status = u8::from_be_bytes(temp);
+        let heater_stability = (status & 0b0001_0000) > 0;
+        let gas_range = status & 0b0000_0111;
+
+        Ok(RawData {
+            pressure,
+            temperature,
+            humidity,
+            gas: (resistance, heater_stability, gas_range),
+        })
     }
 }
 
@@ -98,16 +173,25 @@ impl<T> Bme680<T> {
         // temperature and pressure oversampling is set in the same register that triggers force
         // mode, so are not set until a measurement is triggered
         let to_write = [
+            REG_RES_HEAT,
+            self.calibration
+                .calculate_heat_res(self.config.heater_temp, 20),
+            REG_GAS_WAIT,
+            self.config.heater_on_time,
+            REG_CTRL_GAS_1,
+            u8::from(self.config.run_gas) << 4,
             REG_CTRL_HUM,
             u8::from(self.config.h_oversample),
             REG_CONFIG,
             u8::from(self.config.iir_filter) << 2,
         ];
+
         self.device
             .i2c_buffer()
             .add_write(0, &to_write)
             .execute()
             .map_err(BmeError::SetError)?;
+
         Ok(Bme680 {
             device: self.device,
             config: self.config,
@@ -157,11 +241,30 @@ impl<T> Bme680<T> {
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+struct RawData {
+    pressure: i32,
+    temperature: i32,
+    humidity: i16,
+    gas: (i16, bool, u8),
+}
+
+#[derive(Debug)]
+pub struct Data {
+    pub pressure: f64,
+    pub temperature: f64,
+    pub humidity: f64,
+    pub gas: BmeResult<f64>,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct Config {
     h_oversample: OverSample,
     t_oversample: OverSample,
     p_oversample: OverSample,
     iir_filter: IirFilter,
+    heater_on_time: u8,
+    heater_temp: i32,
+    run_gas: bool,
 }
 
 impl Default for Config {
@@ -177,6 +280,9 @@ impl Config {
             t_oversample: OverSample::X0,
             p_oversample: OverSample::X0,
             iir_filter: IirFilter::C0,
+            heater_on_time: 0,
+            heater_temp: 0,
+            run_gas: false,
         }
     }
 
@@ -194,6 +300,22 @@ impl Config {
 
     pub fn iir_filter(&mut self, filter: IirFilter) {
         self.iir_filter = filter;
+    }
+
+    pub fn heater_on_time(&mut self, time: u8, factor: WaitFactor) -> BmeResult<()> {
+        if time > 0b0011_1111 {
+            return Err(BmeError::TimeError(time));
+        }
+        self.heater_on_time = (u8::from(factor) << 6) | time;
+        Ok(())
+    }
+
+    pub fn heater_temp(&mut self, temp: i32) {
+        self.heater_temp = temp;
+    }
+
+    pub fn run_gas(&mut self, set: bool) {
+        self.run_gas = set;
     }
 }
 
@@ -232,6 +354,22 @@ impl std::convert::From<IirFilter> for u8 {
         arg as u8
     }
 }
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[repr(u8)]
+pub enum WaitFactor {
+    F1 = 0b000,
+    F4 = 0b001,
+    F16 = 0b010,
+    F64 = 0b011,
+}
+
+impl std::convert::From<WaitFactor> for u8 {
+    fn from(arg: WaitFactor) -> u8 {
+        arg as u8
+    }
+}
+
 // all parameter types taken from:
 // https://github.com/BoschSensortec/BME68x-Sensor-API/blob/master/bme68x_defs.h
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -239,6 +377,7 @@ pub struct CalibrationParameters {
     temperature: TempParams,
     pressure: PresParams,
     humidity: HumParams,
+    gas: GasParams,
 }
 
 // see datasheet page 18 for addressess
@@ -276,25 +415,61 @@ struct HumParams {
     hum_7: i8,
 }
 
+// see datasheet page 20 for addressess
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+struct GasParams {
+    gas_1: i8,
+    gas_2: i16,
+    gas_3: i8,
+    heat_range: u8,
+    heat_value: i8,
+}
+
 impl CalibrationParameters {
     fn read(device: &I2c) -> BmeResult<Self> {
         let temperature = CalibrationParameters::read_temp_params(device)?;
         let pressure = CalibrationParameters::read_pres_params(device)?;
         let humidity = CalibrationParameters::read_hum_params(device)?;
+        let gas = CalibrationParameters::read_gas_params(device)?;
 
         Ok(Self {
             temperature,
             pressure,
             humidity,
+            gas,
         })
     }
 
-    fn calculate_pth(&self, raw_pres: i32, raw_temp: i32, raw_hum: i16) -> (f64, f64, f64) {
-        let (temperature, t_fine) = self.calculate_temperature(raw_temp);
-        let pressure = self.calculate_pressure(raw_pres, t_fine);
-        let humidity = self.calculate_humidity(raw_hum, temperature);
+    fn calculate_values(&self, raw_data: RawData) -> Data {
+        let (temperature, t_fine) = self.calculate_temperature(raw_data.temperature);
+        let pressure = self.calculate_pressure(raw_data.pressure, t_fine);
+        let humidity = self.calculate_humidity(raw_data.humidity, temperature);
+        let gas = self.calculate_gas(raw_data.gas);
 
-        (pressure, temperature, humidity)
+        Data {
+            pressure,
+            temperature,
+            humidity,
+            gas,
+        }
+    }
+
+    // calculation as definted in BME680 datasheet (page 21)
+    fn calculate_heat_res(&self, target_temp: i32, ambient_temp: i32) -> u8 {
+        let gas_1 = i32::from(self.gas.gas_1);
+        let gas_2 = i32::from(self.gas.gas_2);
+        let gas_3 = i32::from(self.gas.gas_3);
+        let heat_range = i32::from(self.gas.heat_range);
+        let heat_value = i32::from(self.gas.heat_value);
+
+        let var_1 = (ambient_temp * gas_3 / 10) << 8;
+        // division by 10 must not be last to avoid overflow
+        let var_2 = (gas_1 + 784) / 10 * (((gas_2 + 154009) * target_temp * 5 / 100) + 3276800);
+        let var_3 = var_1 + (var_2 >> 1);
+        let var_4 = var_3 / (heat_range + 4);
+        let var_5 = 131 * heat_value + 65536;
+        let res_heat_x100 = (var_4 / var_5 - 250) * 34;
+        ((res_heat_x100 + 50) / 100).try_into().unwrap()
     }
 
     fn read_temp_params(device: &I2c) -> BmeResult<TempParams> {
@@ -420,6 +595,43 @@ impl CalibrationParameters {
         })
     }
 
+    fn read_gas_params(device: &I2c) -> BmeResult<GasParams> {
+        let mut buffer = [0; 4];
+        device
+            .i2c_read(REG_PAR_G, &mut buffer)
+            .map_err(BmeError::ParamError)?;
+        let buf_checked = &buffer[..4];
+
+        // par_g1 bits, 0xED
+        let par = buf_checked[2..3].try_into().unwrap();
+        let gas_1 = i8::from_le_bytes(par);
+        // par_g2 bits, 0xEC, 0xEB
+        let par = buf_checked[0..2].try_into().unwrap();
+        let gas_2 = i16::from_le_bytes(par);
+        // par_g3 bits, 0xEE
+        let par = buf_checked[3..4].try_into().unwrap();
+        let gas_3 = i8::from_le_bytes(par);
+
+        device
+            .i2c_read(REG_RES_HEAT_RANGE, &mut buffer[0..1])
+            .map_err(BmeError::ParamError)?;
+        let par = buffer[0..1].try_into().unwrap();
+        let heat_range = (u8::from_le_bytes(par) & 0b00110000) >> 4;
+        device
+            .i2c_read(REG_RES_HEAT_VAL, &mut buffer[0..1])
+            .map_err(BmeError::ParamError)?;
+        let par = buffer[0..1].try_into().unwrap();
+        let heat_value = i8::from_le_bytes(par);
+
+        Ok(GasParams {
+            gas_1,
+            gas_2,
+            gas_3,
+            heat_range,
+            heat_value,
+        })
+    }
+
     // calculation as definted in BME680 datasheet (page 17)
     // t_fine parameter returned for use in pressure calculation (see page 18)
     fn calculate_temperature(&self, raw_temp: i32) -> (f64, f64) {
@@ -503,6 +715,16 @@ impl CalibrationParameters {
         let var_4 = hum_7 * PAR4;
         var_2 + (var_3 + var_4 * temp) * var_2 * var_2
     }
+
+    fn calculate_gas(&self, gas: (i16, bool, u8)) -> BmeResult<f64> {
+        let (gas_val, heater_stability, heat_range) = gas;
+        // TODO: calculate gas value
+        let gas = gas_val as f64;
+        match heater_stability {
+            true => Ok(gas),
+            false => Err(BmeError::HeatError(gas)),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -513,12 +735,18 @@ pub enum BmeError {
     ForceError(#[source] I2cError),
     #[error("failed to read measurements")]
     MeasurementError(#[source] I2cError),
+    #[error("failed to read measurement status")]
+    StatusError(#[source] I2cError),
     #[error("failed to read calibration parameters")]
     ParamError(#[source] I2cError),
     #[error("failed to apply parameters")]
     SetError(#[source] I2cError),
     #[error("failed to reset")]
     ResetError(#[from] ResetError),
+    #[error("{0} is an invalid heater time. Valid values range from 0 to 63")]
+    TimeError(u8),
+    #[error("target heater temperature not reached. target temperature may be too high, or wait time may be too low")]
+    HeatError(f64),
 }
 
 #[derive(Debug, Error)]
