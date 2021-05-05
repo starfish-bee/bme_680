@@ -39,6 +39,30 @@ const REG_PAR_G: u8 = 0xEB;
 const REG_RES_HEAT_RANGE: u8 = 0x02;
 // heater resistance value register (page 22)
 const REG_RES_HEAT_VAL: u8 = 0x00;
+// range switching error parameter register (page 23)
+const REG_RANGE_SWITCHING_ERROR: u8 = 0x04;
+//gas constant arrays (page23)
+const GAS_ARRAY_1: [f64; 16] = [
+    1.0, 1.0, 1.0, 1.0, 1.0, 0.99, 1.0, 0.992, 1.0, 1.0, 0.998, 0.995, 1.0, 0.99, 1.0, 1.0,
+];
+const GAS_ARRAY_2: [f64; 16] = [
+    8000000.0,
+    4000000.0,
+    2000000.0,
+    1000000.0,
+    499500.4995,
+    248262.1648,
+    125000.0,
+    63004.03226,
+    31281.28128,
+    15625.0,
+    7812.5,
+    3906.25,
+    1953.125,
+    976.5625,
+    488.28125,
+    244.140625,
+];
 
 pub type BmeResult<T> = Result<T, BmeError>;
 
@@ -423,6 +447,7 @@ struct GasParams {
     gas_3: i8,
     heat_range: u8,
     heat_value: i8,
+    range_switching_error: i8,
 }
 
 impl CalibrationParameters {
@@ -622,6 +647,11 @@ impl CalibrationParameters {
             .map_err(BmeError::ParamError)?;
         let par = buffer[0..1].try_into().unwrap();
         let heat_value = i8::from_le_bytes(par);
+        device
+            .i2c_read(REG_RANGE_SWITCHING_ERROR, &mut buffer[0..1])
+            .map_err(BmeError::ParamError)?;
+        let par = buffer[0..1].try_into().unwrap();
+        let range_switching_error = i8::from_le_bytes(par) >> 4;
 
         Ok(GasParams {
             gas_1,
@@ -629,6 +659,7 @@ impl CalibrationParameters {
             gas_3,
             heat_range,
             heat_value,
+            range_switching_error,
         })
     }
 
@@ -718,8 +749,14 @@ impl CalibrationParameters {
 
     fn calculate_gas(&self, gas: (i16, bool, u8)) -> BmeResult<f64> {
         let (gas_val, heater_stability, heat_range) = gas;
-        // TODO: calculate gas value
-        let gas = gas_val as f64;
+        let gas_val = f64::from(gas_val);
+        let heat_range = usize::from(heat_range);
+        let params = &self.gas;
+        let range_switching_error = f64::from(params.range_switching_error);
+
+        let var_1 = (1340.0 + 5.0 * range_switching_error) * GAS_ARRAY_1[heat_range];
+        let gas = var_1 * GAS_ARRAY_2[heat_range] / (gas_val - 512.0 + var_1);
+
         match heater_stability {
             true => Ok(gas),
             false => Err(BmeError::HeatError(gas)),
