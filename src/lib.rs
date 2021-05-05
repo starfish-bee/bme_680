@@ -161,13 +161,13 @@ impl Bme680<Ready> {
 
         // pressure bits - 0x1F, 0x20, first 4 bits of 0x21
         let temp = buf_checked[..4].try_into().unwrap();
-        let pressure = i32::from_be_bytes(temp) >> 12;
+        let pressure = u32::from_be_bytes(temp) >> 12;
         // temperature bits - 0x22, 0x23, first 4 bits of 0x24
         let temp = buf_checked[3..7].try_into().unwrap();
-        let temperature = i32::from_be_bytes(temp) >> 12;
+        let temperature = u32::from_be_bytes(temp) >> 12;
         // humidity bits - 0x25, 0x26
         let temp = buf_checked[6..8].try_into().unwrap();
-        let humidity = i16::from_be_bytes(temp);
+        let humidity = u16::from_be_bytes(temp);
 
         // gas registers go from 0x2A to 0x2B
         self.device
@@ -177,7 +177,7 @@ impl Bme680<Ready> {
 
         // gas bits - 0x2A, first 2 bits of 0x2B
         let temp = buf_checked[..2].try_into().unwrap();
-        let resistance = i16::from_be_bytes(temp) >> 6;
+        let resistance = u16::from_be_bytes(temp) >> 6;
         let temp = buf_checked[1..2].try_into().unwrap();
         let status = u8::from_be_bytes(temp);
         let heater_stability = (status & 0b0001_0000) > 0;
@@ -266,10 +266,10 @@ impl<T> Bme680<T> {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 struct RawData {
-    pressure: i32,
-    temperature: i32,
-    humidity: i16,
-    gas: (i16, bool, u8),
+    pressure: u32,
+    temperature: u32,
+    humidity: u16,
+    gas: (u16, bool, u8),
 }
 
 #[derive(Debug)]
@@ -665,7 +665,7 @@ impl CalibrationParameters {
 
     // calculation as definted in BME680 datasheet (page 17)
     // t_fine parameter returned for use in pressure calculation (see page 18)
-    fn calculate_temperature(&self, raw_temp: i32) -> (f64, f64) {
+    fn calculate_temperature(&self, raw_temp: u32) -> (f64, f64) {
         const PAR1: f64 = 1.0 / 16384.0;
         const PAR2: f64 = 1.0 / 1024.0;
         const PAR3: f64 = 1.0 / 131072.0;
@@ -686,7 +686,7 @@ impl CalibrationParameters {
     }
 
     // calculation as definted in BME680 datasheet (page 18)
-    fn calculate_pressure(&self, raw_pres: i32, t_fine: f64) -> f64 {
+    fn calculate_pressure(&self, raw_pres: u32, t_fine: f64) -> f64 {
         const PAR1: f64 = 1.0 / 131072.0;
         const PAR2: f64 = 1.0 / 16384.0;
         const PAR3: f64 = 1.0 / 524288.0;
@@ -724,7 +724,7 @@ impl CalibrationParameters {
     }
 
     // calculation as definted in BME680 datasheet (page 20)
-    fn calculate_humidity(&self, raw_hum: i16, temp: f64) -> f64 {
+    fn calculate_humidity(&self, raw_hum: u16, temp: f64) -> f64 {
         const PAR1: f64 = 1.0 / 262144.0;
         const PAR2: f64 = 1.0 / 16384.0;
         const PAR3: f64 = 1.0 / 1048576.0;
@@ -747,7 +747,7 @@ impl CalibrationParameters {
         var_2 + (var_3 + var_4 * temp) * var_2 * var_2
     }
 
-    fn calculate_gas(&self, gas: (i16, bool, u8)) -> BmeResult<f64> {
+    fn calculate_gas(&self, gas: (u16, bool, u8)) -> BmeResult<f64> {
         let (gas_val, heater_stability, heat_range) = gas;
         let gas_val = f64::from(gas_val);
         let heat_range = usize::from(heat_range);
